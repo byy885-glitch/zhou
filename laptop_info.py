@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-笔记本信息采集脚本
+笔记本信息采集工具
 跨平台支持 Windows / Linux / macOS
 采集硬件和系统信息，输出 JSON 文件 + 控制台打印
 """
@@ -20,7 +20,7 @@ except ImportError:
     sys.exit(1)
 
 
-def run_cmd(cmd, timeout=10):
+def run_cmd(cmd, timeout=15):
     """执行系统命令并返回输出"""
     try:
         result = subprocess.run(
@@ -31,8 +31,29 @@ def run_cmd(cmd, timeout=10):
         return ""
 
 
+def run_powershell(cmd, timeout=15):
+    """执行 PowerShell 命令并返回 JSON 解析结果（Windows专用）"""
+    try:
+        full_cmd = f'powershell -NoProfile -Command "{cmd} | ConvertTo-Json -Depth 3 -Compress"'
+        result = subprocess.run(
+            full_cmd, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+        output = result.stdout.strip()
+        if not output:
+            return None
+        # 处理单对象和数组
+        if output.startswith("["):
+            return json.loads(output)
+        else:
+            return [json.loads(output)]
+    except Exception as e:
+        return None
+
+
 def get_size(bytes_val, suffix="B"):
     """字节转换为可读格式"""
+    if bytes_val is None:
+        return "未知"
     factor = 1024
     for unit in ["", "K", "M", "G", "T", "P"]:
         if bytes_val < factor:
@@ -55,7 +76,6 @@ def collect_system_info():
         "采集时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    # Windows 补充
     if platform.system() == "Windows":
         try:
             import winreg
@@ -68,9 +88,7 @@ def collect_system_info():
             winreg.CloseKey(key)
         except Exception:
             pass
-
-    # Linux 补充
-    if platform.system() == "Linux":
+    elif platform.system() == "Linux":
         distro = run_cmd("cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'\"' -f2")
         if distro:
             info["Linux发行版"] = distro
@@ -89,23 +107,17 @@ def collect_cpu_info():
         "逻辑核心数": psutil.cpu_count(logical=True),
         "当前频率(MHz)": round(cpu_freq.current, 1) if cpu_freq else "未知",
         "最大频率(MHz)": round(cpu_freq.max, 1) if cpu_freq and cpu_freq.max > 0 else "未知",
-        "最小频率(MHz)": round(cpu_freq.min, 1) if cpu_freq and cpu_freq.min > 0 else "未知",
         "当前使用率(%)": psutil.cpu_percent(interval=1),
     }
 
-    # CPU 型号
     if platform.system() == "Windows":
-        model = run_cmd('wmic cpu get Name 2>nul | findstr /v "Name"')
-        info["型号"] = model.strip() if model else "未知"
+        data = run_powershell("Get-CimInstance Win32_Processor | Select-Object Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed")
+        if data and len(data) > 0:
+            info["型号"] = data[0].get("Name", "未知")
+            info["厂商"] = data[0].get("Manufacturer", "未知")
     elif platform.system() == "Linux":
         model = run_cmd("lscpu 2>/dev/null | grep 'Model name' | cut -d: -f2")
         info["型号"] = model.strip() if model else "未知"
-        # 补充更多
-        for line in run_cmd("lscpu 2>/dev/null").split("\n"):
-            if "Architecture" in line:
-                info["架构"] = line.split(":")[1].strip()
-            if "Vendor ID" in line:
-                info["厂商"] = line.split(":")[1].strip()
     elif platform.system() == "Darwin":
         model = run_cmd("sysctl -n machdep.cpu.brand_string 2>/dev/null")
         info["型号"] = model.strip() if model else "未知"
@@ -127,26 +139,26 @@ def collect_memory_info():
         "交换分区使用率(%)": swap.percent,
     }
 
-    # 内存插槽详情
     slots = []
     if platform.system() == "Windows":
-        output = run_cmd('wmic memorychip get DeviceLocator,Capacity,Speed,Manufacturer,PartNumber 2>nul')
-        lines = [l for l in output.split("\n") if l.strip() and not l.startswith("DeviceLocator")]
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 5:
-                slots.append({
-                    "插槽": parts[0],
-                    "容量": get_size(int(parts[1])),
-                    "频率(MHz)": parts[2],
-                    "厂商": parts[3],
-                    "型号": parts[4],
-                })
+        data = run_powershell("Get-CimInstance Win32_PhysicalMemory | Select-Object DeviceLocator,Capacity,Speed,Manufacturer,PartNumber")
+        if data:
+            for item in data:
+                try:
+                    capacity = item.get("Capacity")
+                    slots.append({
+                        "插槽": item.get("DeviceLocator", "未知"),
+                        "容量": get_size(int(capacity)) if capacity else "未知",
+                        "频率(MHz)": item.get("Speed", "未知"),
+                        "厂商": item.get("Manufacturer", "未知"),
+                        "型号": item.get("PartNumber", "未知"),
+                    })
+                except Exception:
+                    continue
     elif platform.system() == "Linux":
         output = run_cmd("sudo dmidecode -t memory 2>/dev/null | grep -A5 'Memory Device' | grep -E 'Size:|Locator:|Speed:|Manufacturer:|Part Number:'")
         if not output:
             output = run_cmd("lshw -class memory 2>/dev/null | grep -E 'size:|product:|vendor:|slot:'")
-        # 简化解析
         current = {}
         for line in output.split("\n"):
             line = line.strip()
@@ -192,20 +204,21 @@ def collect_disk_info():
         except (PermissionError, OSError):
             continue
 
-    # 物理磁盘型号
     physical_disks = []
     if platform.system() == "Windows":
-        output = run_cmd('wmic diskdrive get Model,Size,MediaType,InterfaceType 2>nul')
-        lines = [l for l in output.split("\n") if l.strip() and not l.startswith("InterfaceType")]
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 4:
-                physical_disks.append({
-                    "型号": " ".join(parts[:-3]),
-                    "容量": get_size(int(parts[-3])),
-                    "类型": parts[-2],
-                    "接口": parts[-1],
-                })
+        data = run_powershell("Get-CimInstance Win32_DiskDrive | Select-Object Model,Size,MediaType,InterfaceType")
+        if data:
+            for item in data:
+                try:
+                    size = item.get("Size")
+                    physical_disks.append({
+                        "型号": item.get("Model", "未知"),
+                        "容量": get_size(int(size)) if size else "未知",
+                        "类型": item.get("MediaType", "未知"),
+                        "接口": item.get("InterfaceType", "未知"),
+                    })
+                except Exception:
+                    continue
     elif platform.system() == "Linux":
         output = run_cmd("lsblk -d -o NAME,MODEL,SIZE,TYPE,TRAN 2>/dev/null | grep -v loop")
         for line in output.split("\n")[1:]:
@@ -222,67 +235,49 @@ def collect_disk_info():
         output = run_cmd("diskutil list physical 2>/dev/null")
         physical_disks.append({"信息": output[:500] if output else "未知"})
 
-    result = {
+    return {
         "逻辑分区": disks,
         "物理磁盘": physical_disks if physical_disks else "需要管理员权限获取",
     }
-    return result
 
 
 def collect_gpu_info():
     """采集显卡信息"""
     gpus = []
 
-    if platform.system() == "Windows":
-        output = run_cmd('wmic path win32_VideoController get Name,AdapterRAM,DriverVersion,VideoProcessor 2>nul')
-        lines = [l for l in output.split("\n") if l.strip() and not l.startswith("AdapterRAM")]
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 3:
-                try:
-                    vram = get_size(int(parts[0]))
-                except (ValueError, IndexError):
-                    vram = "未知"
+    # NVIDIA GPU 优先（跨平台）
+    nvidia = run_cmd("nvidia-smi --query-gpu=name,memory.total,driver_version,temperature.gpu,utilization.gpu --format=csv,noheader 2>/dev/null")
+    if nvidia:
+        for line in nvidia.split("\n"):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 5:
                 gpus.append({
-                    "型号": " ".join(parts[3:]) if len(parts) > 3 else " ".join(parts[1:]),
-                    "显存": vram,
-                    "驱动版本": parts[1] if len(parts) > 1 else "未知",
+                    "型号": parts[0],
+                    "显存": parts[1],
+                    "驱动版本": parts[2],
+                    "温度(℃)": parts[3],
+                    "使用率(%)": parts[4],
                 })
-        # NVIDIA GPU 补充
-        nvidia = run_cmd('nvidia-smi --query-gpu=name,memory.total,driver_version,temperature.gpu,utilization.gpu --format=csv,noheader 2>nul')
-        if nvidia:
-            gpus = []
-            for line in nvidia.split("\n"):
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 5:
+
+    if not gpus and platform.system() == "Windows":
+        data = run_powershell("Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion,VideoProcessor")
+        if data:
+            for item in data:
+                try:
+                    vram = item.get("AdapterRAM")
                     gpus.append({
-                        "型号": parts[0],
-                        "显存": parts[1],
-                        "驱动版本": parts[2],
-                        "温度(℃)": parts[3],
-                        "使用率(%)": parts[4],
+                        "型号": item.get("Name", "未知"),
+                        "显存": get_size(int(vram)) if vram else "未知",
+                        "驱动版本": item.get("DriverVersion", "未知"),
                     })
-    elif platform.system() == "Linux":
-        # NVIDIA
-        nvidia = run_cmd("nvidia-smi --query-gpu=name,memory.total,driver_version,temperature.gpu,utilization.gpu --format=csv,noheader 2>/dev/null")
-        if nvidia:
-            for line in nvidia.split("\n"):
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 5:
-                    gpus.append({
-                        "型号": parts[0],
-                        "显存": parts[1],
-                        "驱动版本": parts[2],
-                        "温度(℃)": parts[3],
-                        "使用率(%)": parts[4],
-                    })
-        # AMD / Intel
-        if not gpus:
-            output = run_cmd("lspci 2>/dev/null | grep -iE 'vga|3d|display'")
-            for line in output.split("\n"):
-                if line.strip():
-                    gpus.append({"型号": line.split(":")[-1].strip()})
-    elif platform.system() == "Darwin":
+                except Exception:
+                    continue
+    elif not gpus and platform.system() == "Linux":
+        output = run_cmd("lspci 2>/dev/null | grep -iE 'vga|3d|display'")
+        for line in output.split("\n"):
+            if line.strip():
+                gpus.append({"型号": line.split(":")[-1].strip()})
+    elif not gpus and platform.system() == "Darwin":
         output = run_cmd("system_profiler SPDisplaysDataType 2>/dev/null | grep -E 'Chipset Model:|VRAM:|Metal:|Resolution:'")
         current = {}
         for line in output.split("\n"):
@@ -320,7 +315,6 @@ def collect_network_info():
                 info["MAC地址"] = addr.address
         interfaces.append(info)
 
-    # 网络流量
     io = psutil.net_io_counters()
     traffic = {
         "总发送": get_size(io.bytes_sent),
@@ -347,23 +341,20 @@ def collect_battery_info():
         "预计剩余时间": f"{battery.secsleft // 60} 分钟" if battery.secsleft != psutil.POWER_TIME_UNLIMITED else "未知",
     }
 
-    # 电池详细信息
     if platform.system() == "Windows":
-        output = run_cmd('wmic path Win32_Battery get Name,DesignCapacity,FullChargeCapacity,EstimatedChargeRemaining,BatteryStatus 2>nul')
-        lines = [l for l in output.split("\n") if l.strip() and not l.startswith("BatteryStatus")]
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 5:
-                try:
-                    design = int(parts[-4])
-                    full = int(parts[-3])
-                    health = round(full / design * 100, 1) if design > 0 else 0
-                    info["设计容量(mWh)"] = design
-                    info["满充容量(mWh)"] = full
-                    info["电池健康度(%)"] = health
-                except (ValueError, IndexError):
-                    pass
-                info["电池型号"] = " ".join(parts[:-4]) if len(parts) > 4 else "未知"
+        data = run_powershell("Get-CimInstance Win32_Battery | Select-Object Name,DesignCapacity,FullChargeCapacity,EstimatedChargeRemaining,BatteryStatus")
+        if data and len(data) > 0:
+            item = data[0]
+            try:
+                design = item.get("DesignCapacity")
+                full = item.get("FullChargeCapacity")
+                if design and full and int(design) > 0:
+                    info["设计容量(mWh)"] = int(design)
+                    info["满充容量(mWh)"] = int(full)
+                    info["电池健康度(%)"] = round(int(full) / int(design) * 100, 1)
+                info["电池型号"] = item.get("Name", "未知")
+            except Exception:
+                pass
     elif platform.system() == "Linux":
         output = run_cmd("upower -i $(upower -e 2>/dev/null | grep BAT) 2>/dev/null | grep -E 'energy-full:|energy-full-design:|capacity:|model:|vendor:|technology:'")
         for line in output.split("\n"):
@@ -395,25 +386,21 @@ def collect_bios_info():
     info = {}
 
     if platform.system() == "Windows":
-        output = run_cmd('wmic bios get Manufacturer,SMBIOSBIOSVersion,ReleaseDate,SerialNumber 2>nul')
-        lines = [l for l in output.split("\n") if l.strip() and not l.startswith("Manufacturer")]
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 4:
-                info["BIOS厂商"] = parts[0]
-                info["BIOS版本"] = parts[1]
-                info["发布日期"] = parts[2]
-                info["序列号"] = parts[3]
-        # 主板
-        board = run_cmd('wmic baseboard get Manufacturer,Product,Version,SerialNumber 2>nul')
-        lines = [l for l in board.split("\n") if l.strip() and not l.startswith("Manufacturer")]
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 4:
-                info["主板厂商"] = parts[0]
-                info["主板型号"] = parts[1]
-                info["主板版本"] = parts[2]
-                info["主板序列号"] = parts[3]
+        bios = run_powershell("Get-CimInstance Win32_BIOS | Select-Object Manufacturer,SMBIOSBIOSVersion,ReleaseDate,SerialNumber")
+        if bios and len(bios) > 0:
+            b = bios[0]
+            info["BIOS厂商"] = b.get("Manufacturer", "未知")
+            info["BIOS版本"] = b.get("SMBIOSBIOSVersion", "未知")
+            info["发布日期"] = str(b.get("ReleaseDate", "未知"))[:10]
+            info["序列号"] = b.get("SerialNumber", "未知")
+
+        board = run_powershell("Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product,Version,SerialNumber")
+        if board and len(board) > 0:
+            b = board[0]
+            info["主板厂商"] = b.get("Manufacturer", "未知")
+            info["主板型号"] = b.get("Product", "未知")
+            info["主板版本"] = b.get("Version", "未知")
+            info["主板序列号"] = b.get("SerialNumber", "未知")
     elif platform.system() == "Linux":
         output = run_cmd("sudo dmidecode -t bios 2>/dev/null | grep -E 'Vendor:|Version:|Release Date:|Serial Number:'")
         for line in output.split("\n"):
@@ -425,7 +412,6 @@ def collect_bios_info():
                 info["发布日期"] = line.split("Release Date:")[1].strip()
             elif "Serial Number:" in line:
                 info["序列号"] = line.split("Serial Number:")[1].strip()
-        # 主板
         board = run_cmd("sudo dmidecode -t baseboard 2>/dev/null | grep -E 'Manufacturer:|Product Name:|Version:|Serial Number:'")
         for line in board.split("\n"):
             if "Manufacturer:" in line:
@@ -451,27 +437,23 @@ def collect_display_info():
     displays = []
 
     if platform.system() == "Windows":
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            screens = []
-            for i in range(10):
-                w = user32.GetSystemMetrics(78) if i == 0 else 0
-                # 简化：使用 powershell 获取
-                break
-        except Exception:
-            pass
-        output = run_cmd('powershell -Command "Get-CimInstance -Namespace root\\\\wmi -ClassName WmiMonitorBasicDisplayParams | ForEach-Object { $_.InstanceName }" 2>nul')
-        # 更简单的方式
-        output2 = run_cmd('wmic desktopmonitor get ScreenHeight,ScreenWidth,Name 2>nul')
-        lines = [l for l in output2.split("\n") if l.strip() and not l.startswith("Name")]
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 3:
-                displays.append({
-                    "名称": " ".join(parts[2:]),
-                    "分辨率": f"{parts[1]}x{parts[0]}",
-                })
+        data = run_powershell("Get-CimInstance Win32_DesktopMonitor | Select-Object Name,ScreenHeight,ScreenWidth")
+        if data:
+            for item in data:
+                try:
+                    h = item.get("ScreenHeight")
+                    w = item.get("ScreenWidth")
+                    displays.append({
+                        "名称": item.get("Name", "未知"),
+                        "分辨率": f"{w}x{h}" if w and h else "未知",
+                    })
+                except Exception:
+                    continue
+        # 补充：获取内置显示器的详细信息
+        if not displays:
+            output = run_cmd('powershell -NoProfile -Command "Get-CimInstance -Namespace root\\\\wmi -ClassName WmiMonitorBasicDisplayParams | ForEach-Object { $_.InstanceName }" 2>nul')
+            if output:
+                displays.append({"信息": "检测到显示器，但需要管理员权限获取详细分辨率"})
     elif platform.system() == "Linux":
         output = run_cmd("xrandr 2>/dev/null | grep -E ' connected|\\*'")
         current = None
@@ -535,18 +517,26 @@ def main():
     print(f"主机: {platform.node()}")
     print("正在采集信息，请稍候...\n")
 
-    # 采集所有信息
-    data = {
-        "系统信息": collect_system_info(),
-        "CPU信息": collect_cpu_info(),
-        "内存信息": collect_memory_info(),
-        "磁盘信息": collect_disk_info(),
-        "显卡信息": collect_gpu_info(),
-        "网络信息": collect_network_info(),
-        "电池信息": collect_battery_info(),
-        "BIOS/主板信息": collect_bios_info(),
-        "显示器信息": collect_display_info(),
-    }
+    # 采集所有信息（每个函数独立try，单个失败不影响整体）
+    collectors = [
+        ("系统信息", collect_system_info),
+        ("CPU信息", collect_cpu_info),
+        ("内存信息", collect_memory_info),
+        ("磁盘信息", collect_disk_info),
+        ("显卡信息", collect_gpu_info),
+        ("网络信息", collect_network_info),
+        ("电池信息", collect_battery_info),
+        ("BIOS/主板信息", collect_bios_info),
+        ("显示器信息", collect_display_info),
+    ]
+
+    data = {}
+    for name, func in collectors:
+        try:
+            data[name] = func()
+        except Exception as e:
+            data[name] = {"采集失败": str(e)}
+            print(f"[警告] {name}采集失败: {e}")
 
     # 控制台打印
     for section, content in data.items():
@@ -563,12 +553,14 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"laptop_info_{hostname}_{timestamp}.json"
 
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-    print("\n" + "=" * 60)
-    print(f"  采集完成！结果已保存到: {filename}")
-    print("=" * 60)
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print("\n" + "=" * 60)
+        print(f"  采集完成！结果已保存到: {filename}")
+        print("=" * 60)
+    except Exception as e:
+        print(f"\n[错误] 保存JSON失败: {e}")
 
     return filename
 
