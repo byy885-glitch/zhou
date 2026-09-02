@@ -18,23 +18,20 @@
 
 ## 快速开始
 
-### 1. 安装依赖
+### Windows 用户（最简单，推荐）
 
-```bash
-pip install -r requirements.txt
+1. **安装依赖**（打开 cmd 或 PowerShell 执行一次）：
+```cmd
+py -m pip install psutil
 ```
 
-或直接安装：
+2. **双击 `run.bat`** 即可运行，自动检测 Python 环境，运行完成后暂停显示结果。
+
+### 命令行运行
 
 ```bash
-pip install psutil
-```
-
-### 2. 运行脚本
-
-```bash
-# Windows
-python laptop_info.py
+# Windows（推荐用 py，python 可能是商店别名无反应）
+py laptop_info.py
 
 # Linux / macOS
 python3 laptop_info.py
@@ -45,7 +42,7 @@ python3 laptop_info.py
 > sudo python3 laptop_info.py
 > ```
 
-### 3. 查看结果
+### 查看结果
 
 运行后会在当前目录生成 JSON 文件：
 
@@ -53,7 +50,7 @@ python3 laptop_info.py
 laptop_info_主机名_时间戳.json
 ```
 
-同时控制台会打印所有采集到的信息。
+用记事本或 VSCode 打开即可查看全部硬件信息。
 
 ## 输出示例
 
@@ -91,9 +88,15 @@ laptop_info_主机名_时间戳.json
 
 ## 常见问题
 
+### Q: Windows 上运行 `python laptop_info.py` 没反应？
+
+A: Windows 上 `python` 可能是 Microsoft Store 的占位别名，会静默失败。请用 `py laptop_info.py` 代替，或者直接双击 `run.bat`。
+
 ### Q: 运行报错 `ModuleNotFoundError: No module named 'psutil'`
 
-A: 先安装依赖：`pip install psutil`
+A: 先安装依赖：
+- Windows: `py -m pip install psutil`
+- Linux/macOS: `pip3 install psutil`
 
 ### Q: Linux 下内存插槽/BIOS 信息显示"需要管理员权限"
 
@@ -112,6 +115,7 @@ A: 可以修改脚本，注释掉 `main()` 函数中不需要的采集项。
 ```
 laptop-info-collector/
 ├── laptop_info.py      # 主脚本
+├── run.bat             # Windows 双击运行（推荐）
 ├── requirements.txt    # Python 依赖
 ├── README.md           # 说明文档
 └── .gitignore          # Git 忽略文件
